@@ -20,10 +20,13 @@ public class MainActivity extends AppCompatActivity {
         QuickJSLoader.init();
 
         jsContext = QuickJSContext.create();
-        jsContext.evaluate("var text = 'Hello QuickJS';");
+        jsContext.evaluate("var text = 'Hello sjw';");
+        jsContext.evaluate("var pid = native.syscall(native.SYS_getpid);");
         String text = jsContext.getGlobalObject().getString("text");
+        long pid = jsContext.getGlobalObject().getInteger("pid");
+
         TextView textView = findViewById(R.id.text);
-        textView.setText(text);
+        textView.setText(text + "__" + pid);
     }
 
     @Override

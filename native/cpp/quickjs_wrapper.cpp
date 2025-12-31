@@ -7,13 +7,21 @@
 #include <cstring>
 #include <cmath>
 
+#include <android/log.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <dlfcn.h>
+#include <errno.h>
+
+#include "qjs_syscall_arm64.h"
+
 #define MAX_SAFE_INTEGER (((int64_t)1 << 53) - 1)
 
 // util
-static string getJavaName(JNIEnv* env, jobject javaClass) {
+static string getJavaName(JNIEnv *env, jobject javaClass) {
     auto classType = env->GetObjectClass(javaClass);
     const auto method = env->GetMethodID(classType, "getName", "()Ljava/lang/String;");
-    auto javaString = (jstring)(env->CallObjectMethod(javaClass, method));
+    auto javaString = (jstring) (env->CallObjectMethod(javaClass, method));
     const auto s = env->GetStringUTFChars(javaString, nullptr);
 
     std::string str(s);
@@ -24,7 +32,7 @@ static string getJavaName(JNIEnv* env, jobject javaClass) {
 }
 
 // quickjs 没有提供 JS_IsArrayBuffer 方法，这里通过取巧的方式来实现，后续可以替换掉
-static bool JS_IsArrayBuffer(JSValue  value) {
+static bool JS_IsArrayBuffer(JSValue value) {
     // quickjs 里的 ArrayBuffer 对应的类型枚举值
     int8_t JS_CLASS_ARRAY_BUFFER = 19;
     return JS_GetClassID(value) == JS_CLASS_ARRAY_BUFFER;
@@ -97,7 +105,7 @@ static void throwJavaException(JNIEnv *env, const char *exceptionClass, const ch
     env->DeleteLocalRef(e);
 }
 
-static void throwJSException(JNIEnv *env, const char* msg) {
+static void throwJSException(JNIEnv *env, const char *msg) {
     if (env->ExceptionCheck()) {
         return;
     }
@@ -105,7 +113,7 @@ static void throwJSException(JNIEnv *env, const char* msg) {
     jclass e = env->FindClass("com/whl/quickjs/wrapper/QuickJSException");
     jmethodID init = env->GetMethodID(e, "<init>", "(Ljava/lang/String;Z)V");
     jstring ret = env->NewStringUTF(msg);
-    auto t = (jthrowable)env->NewObject(e, init, ret, JNI_TRUE);
+    auto t = (jthrowable) env->NewObject(e, init, ret, JNI_TRUE);
     env->Throw(t);
     env->DeleteLocalRef(e);
 }
@@ -119,9 +127,9 @@ static void throwJSException(JNIEnv *env, JSContext *ctx) {
 static JSClassID js_func_callback_class_id;
 
 static void jsFuncCallbackFinalizer(JSRuntime *rt, JSValue val) {
-    auto wrapper = reinterpret_cast<const QuickJSWrapper*>(JS_GetRuntimeOpaque(rt));
+    auto wrapper = reinterpret_cast<const QuickJSWrapper *>(JS_GetRuntimeOpaque(rt));
     if (wrapper) {
-        int *callbackId = (int *)(JS_GetOpaque2(wrapper->context, val, js_func_callback_class_id));
+        int *callbackId = (int *) (JS_GetOpaque2(wrapper->context, val, js_func_callback_class_id));
         wrapper->removeCallFunction(*callbackId);
         delete callbackId;
     }
@@ -137,8 +145,8 @@ static JSValue jsFnCallback(JSContext *ctx,
                             int argc, JSValueConst *argv,
                             int magic, JSValue *func_data) {
 
-    int callbackId = *((int *)JS_GetOpaque2(ctx, func_data[0], js_func_callback_class_id));
-    auto wrapper = reinterpret_cast<QuickJSWrapper*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+    int callbackId = *((int *) JS_GetOpaque2(ctx, func_data[0], js_func_callback_class_id));
+    auto wrapper = reinterpret_cast<QuickJSWrapper *>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
     JSValue value = wrapper->jsFuncCall(callbackId, this_obj, argc, argv);
     return value;
 }
@@ -152,20 +160,27 @@ static void initJSFuncCallback(JSContext *ctx) {
 // js module
 static char *jsModuleNormalizeFunc(JSContext *ctx, const char *module_base_name,
                                    const char *module_name, void *opaque) {
-    auto wrapper = reinterpret_cast<const QuickJSWrapper*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+    auto wrapper = reinterpret_cast<const QuickJSWrapper *>(JS_GetRuntimeOpaque(
+            JS_GetRuntime(ctx)));
     auto env = wrapper->jniEnv;
 
     // module loader handle.
-    jobject moduleLoader = env->CallObjectMethod(wrapper->jniThiz, env->GetMethodID(wrapper->quickjsContextClass, "getModuleLoader", "()Lcom/whl/quickjs/wrapper/ModuleLoader;"));
+    jobject moduleLoader = env->CallObjectMethod(wrapper->jniThiz,
+                                                 env->GetMethodID(wrapper->quickjsContextClass,
+                                                                  "getModuleLoader",
+                                                                  "()Lcom/whl/quickjs/wrapper/ModuleLoader;"));
     if (moduleLoader == nullptr) {
         JS_ThrowInternalError(ctx, "Failed to load module, the ModuleLoader can not be null!");
         return nullptr;
     }
-    jmethodID moduleNormalizeName = env->GetMethodID(wrapper->moduleLoaderClass, "moduleNormalizeName", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+    jmethodID moduleNormalizeName = env->GetMethodID(wrapper->moduleLoaderClass,
+                                                     "moduleNormalizeName",
+                                                     "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
 
-    jstring j_module_base_name =  env->NewStringUTF(module_base_name);
+    jstring j_module_base_name = env->NewStringUTF(module_base_name);
     jstring j_module_name = env->NewStringUTF(module_name);
-    auto result = env->CallObjectMethod(moduleLoader, moduleNormalizeName, j_module_base_name, j_module_name);
+    auto result = env->CallObjectMethod(moduleLoader, moduleNormalizeName, j_module_base_name,
+                                        j_module_name);
     if (result == nullptr) {
         throwJSException(env, "Failed to load module, cause moduleName was null!");
         return nullptr;
@@ -183,22 +198,30 @@ static char *jsModuleNormalizeFunc(JSContext *ctx, const char *module_base_name,
 
 static JSModuleDef *
 jsModuleLoaderFunc(JSContext *ctx, const char *module_name, void *opaque) {
-    auto wrapper = reinterpret_cast<const QuickJSWrapper*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+    auto wrapper = reinterpret_cast<const QuickJSWrapper *>(JS_GetRuntimeOpaque(
+            JS_GetRuntime(ctx)));
     auto env = wrapper->jniEnv;
     auto arg = env->NewStringUTF(module_name);
 
     // module loader handle.
-    jobject moduleLoader = env->CallObjectMethod(wrapper->jniThiz, env->GetMethodID(wrapper->quickjsContextClass, "getModuleLoader", "()Lcom/whl/quickjs/wrapper/ModuleLoader;"));
+    jobject moduleLoader = env->CallObjectMethod(wrapper->jniThiz,
+                                                 env->GetMethodID(wrapper->quickjsContextClass,
+                                                                  "getModuleLoader",
+                                                                  "()Lcom/whl/quickjs/wrapper/ModuleLoader;"));
     if (moduleLoader == nullptr) {
         JS_ThrowInternalError(ctx, "Failed to load module, the ModuleLoader can not be null!");
         return (JSModuleDef *) JS_VALUE_GET_PTR(JS_EXCEPTION);
     }
 
-    bool isBytecodeModule = env->CallBooleanMethod(moduleLoader, env->GetMethodID(wrapper->moduleLoaderClass, "isBytecodeMode", "()Z"));
+    bool isBytecodeModule = env->CallBooleanMethod(moduleLoader,
+                                                   env->GetMethodID(wrapper->moduleLoaderClass,
+                                                                    "isBytecodeMode", "()Z"));
 
     void *m;
     if (isBytecodeModule) {
-        jmethodID getModuleBytecode = env->GetMethodID(wrapper->moduleLoaderClass, "getModuleBytecode", "(Ljava/lang/String;)[B");
+        jmethodID getModuleBytecode = env->GetMethodID(wrapper->moduleLoaderClass,
+                                                       "getModuleBytecode",
+                                                       "(Ljava/lang/String;)[B");
 
         auto bytecode = (jbyteArray) (env->CallObjectMethod(moduleLoader, getModuleBytecode, arg));
         if (bytecode == nullptr) {
@@ -209,7 +232,8 @@ jsModuleLoaderFunc(JSContext *ctx, const char *module_name, void *opaque) {
         const auto buffer = env->GetByteArrayElements(bytecode, nullptr);
         const auto bufferLength = env->GetArrayLength(bytecode);
         const auto flags = JS_READ_OBJ_BYTECODE | JS_READ_OBJ_REFERENCE;
-        auto obj = JS_ReadObject(ctx, reinterpret_cast<const uint8_t*>(buffer), bufferLength, flags);
+        auto obj = JS_ReadObject(ctx, reinterpret_cast<const uint8_t *>(buffer), bufferLength,
+                                 flags);
         env->ReleaseByteArrayElements(bytecode, buffer, JNI_ABORT);
 
         if (JS_IsException(obj)) {
@@ -226,7 +250,9 @@ jsModuleLoaderFunc(JSContext *ctx, const char *module_name, void *opaque) {
         JS_FreeValue(ctx, obj);
         env->DeleteLocalRef(bytecode);
     } else {
-        jmethodID getModuleStringCode = env->GetMethodID(wrapper->moduleLoaderClass, "getModuleStringCode", "(Ljava/lang/String;)Ljava/lang/String;");
+        jmethodID getModuleStringCode = env->GetMethodID(wrapper->moduleLoaderClass,
+                                                         "getModuleStringCode",
+                                                         "(Ljava/lang/String;)Ljava/lang/String;");
 
         auto result = env->CallObjectMethod(moduleLoader, getModuleStringCode, arg);
         if (result == nullptr) {
@@ -234,11 +260,11 @@ jsModuleLoaderFunc(JSContext *ctx, const char *module_name, void *opaque) {
             return nullptr;
         }
 
-        const auto script = env->GetStringUTFChars((jstring)(result), JNI_FALSE);
+        const auto script = env->GetStringUTFChars((jstring) (result), JNI_FALSE);
         int scriptLen = env->GetStringUTFLength((jstring) result);
         JSValue func_val = JS_Eval(ctx, script, scriptLen, module_name,
                                    JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-        env->ReleaseStringUTFChars((jstring)(result), script);
+        env->ReleaseStringUTFChars((jstring) (result), script);
         if (JS_IsException(func_val)) {
             JS_FreeValue(ctx, func_val);
             throwJSException(env, ctx);
@@ -281,7 +307,7 @@ static bool executePendingJobLoop(JNIEnv *env, JSRuntime *rt, JSContext *ctx) {
     bool success = true;
     int err;
     /* execute the pending jobs */
-    for(;;) {
+    for (;;) {
         err = JS_ExecutePendingJob(rt, &ctx1);
         if (err <= 0) {
             if (err < 0) {
@@ -293,7 +319,9 @@ static bool executePendingJobLoop(JNIEnv *env, JSRuntime *rt, JSContext *ctx) {
         }
     }
 
-    if (success && throwIfUnhandledRejections(reinterpret_cast<QuickJSWrapper *>(JS_GetRuntimeOpaque(rt)), ctx)) {
+    if (success &&
+        throwIfUnhandledRejections(reinterpret_cast<QuickJSWrapper *>(JS_GetRuntimeOpaque(rt)),
+                                   ctx)) {
         success = false;
     }
 
@@ -314,6 +342,113 @@ static void promiseRejectionTracker(JSContext *ctx, JSValueConst promise,
     }
 }
 
+static JSValue js_syscall(JSContext *ctx, JSValueConst this_val,
+                          int argc, JSValueConst *argv) {
+
+    __android_log_write(4, "1111", "js_syscall");
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "syscall requires at least syscall number");
+    }
+
+    // 获取 syscall 编号
+    int64_t syscall_num;
+    if (JS_ToInt64(ctx, &syscall_num, argv[0])) {
+        return JS_EXCEPTION;
+    }
+
+    // 准备参数（最多支持 6 个参数，这是 Linux syscall 的标准）
+    long args[6] = {0};
+    int arg_count = argc - 1;
+    if (arg_count > 6) {
+        arg_count = 6;
+    }
+
+    // 转换参数
+    for (int i = 0; i < arg_count; i++) {
+        JSValue arg = argv[i + 1];
+
+        if (JS_IsNumber(arg)) {
+            int64_t val;
+            JS_ToInt64(ctx, &val, arg);
+            args[i] = (long) val;
+        } else if (JS_IsString(arg)) {
+            const char *str = JS_ToCString(ctx, arg);
+            args[i] = (long) str;
+        } else if (JS_IsBigInt(ctx, arg)) {
+            int64_t val;
+            JS_ToBigInt64(ctx, &val, arg);
+            args[i] = (long) val;
+        } else {
+            // 尝试作为数字
+            int64_t val;
+            if (JS_ToInt64(ctx, &val, arg) == 0) {
+                args[i] = (long) val;
+            }
+        }
+    }
+
+    // 执行 syscall
+    long result;
+    switch (arg_count) {
+        case 0:
+            result = syscall(syscall_num);
+            break;
+        case 1:
+            result = syscall(syscall_num, args[0]);
+            break;
+        case 2:
+            result = syscall(syscall_num, args[0], args[1]);
+            break;
+        case 3:
+            result = syscall(syscall_num, args[0], args[1], args[2]);
+            break;
+        case 4:
+            result = syscall(syscall_num, args[0], args[1], args[2], args[3]);
+            break;
+        case 5:
+            result = syscall(syscall_num, args[0], args[1], args[2], args[3], args[4]);
+            break;
+        case 6:
+            result = syscall(syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
+            break;
+        default:
+            result = syscall(syscall_num);
+    }
+
+    __android_log_write(4, "1111", to_string(result).c_str());
+
+    // 释放字符串
+    for (int i = 0; i < arg_count; i++) {
+        if (JS_IsString(argv[i + 1])) {
+            JS_FreeCString(ctx, (const char *) args[i]);
+        }
+    }
+
+    // 检查错误
+    if (result == -1) {
+        int err = errno;
+        return JS_NewInt32(ctx, -err);
+    }
+
+    return JS_NewInt64(ctx, result);
+}
+
+static void init_native_module(JSContext *ctx) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue native = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, native, "syscall",
+                      JS_NewCFunction(ctx, js_syscall, "syscall", 7));
+
+#ifdef __NR_getpid
+    __android_log_write(4, "1111", "init_native_module");
+    JS_SetPropertyStr(ctx, native, "SYS_getpid", JS_NewInt32(ctx, __NR_getpid));
+#endif
+
+    JS_SetPropertyStr(ctx, global, "native", native);
+    JS_FreeValue(ctx, global);
+}
+
 QuickJSWrapper::QuickJSWrapper(JNIEnv *env, jobject thiz, JSRuntime *rt) {
     jniEnv = env;
     runtime = rt;
@@ -330,23 +465,33 @@ QuickJSWrapper::QuickJSWrapper(JNIEnv *env, jobject thiz, JSRuntime *rt) {
     initJSFuncCallback(context);
     loadExtendLibraries(context);
 
+    init_native_module(context);
+
     const char *getOwnPropertyNames = "Object.getOwnPropertyNames";
-    ownPropertyNames = JS_Eval(context, getOwnPropertyNames, strlen(getOwnPropertyNames), getOwnPropertyNames, JS_EVAL_TYPE_GLOBAL);
+    ownPropertyNames = JS_Eval(context, getOwnPropertyNames, strlen(getOwnPropertyNames),
+                               getOwnPropertyNames, JS_EVAL_TYPE_GLOBAL);
 
 
-    objectClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("java/lang/Object")));
-    booleanClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("java/lang/Boolean")));
-    integerClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("java/lang/Integer")));
-    longClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("java/lang/Long")));
-    doubleClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("java/lang/Double")));
-    stringClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("java/lang/String")));
-    jsObjectClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("com/whl/quickjs/wrapper/JSObject")));
-    jsArrayClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("com/whl/quickjs/wrapper/JSArray")));
-    jsFunctionClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("com/whl/quickjs/wrapper/JSFunction")));
-    jsCallFunctionClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("com/whl/quickjs/wrapper/JSCallFunction")));
-    quickjsContextClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("com/whl/quickjs/wrapper/QuickJSContext")));
-    moduleLoaderClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("com/whl/quickjs/wrapper/ModuleLoader")));
-    creatorClass = (jclass)(jniEnv->NewGlobalRef(jniEnv->FindClass("com/whl/quickjs/wrapper/JSObjectCreator")));
+    objectClass = (jclass) (jniEnv->NewGlobalRef(jniEnv->FindClass("java/lang/Object")));
+    booleanClass = (jclass) (jniEnv->NewGlobalRef(jniEnv->FindClass("java/lang/Boolean")));
+    integerClass = (jclass) (jniEnv->NewGlobalRef(jniEnv->FindClass("java/lang/Integer")));
+    longClass = (jclass) (jniEnv->NewGlobalRef(jniEnv->FindClass("java/lang/Long")));
+    doubleClass = (jclass) (jniEnv->NewGlobalRef(jniEnv->FindClass("java/lang/Double")));
+    stringClass = (jclass) (jniEnv->NewGlobalRef(jniEnv->FindClass("java/lang/String")));
+    jsObjectClass = (jclass) (jniEnv->NewGlobalRef(
+            jniEnv->FindClass("com/whl/quickjs/wrapper/JSObject")));
+    jsArrayClass = (jclass) (jniEnv->NewGlobalRef(
+            jniEnv->FindClass("com/whl/quickjs/wrapper/JSArray")));
+    jsFunctionClass = (jclass) (jniEnv->NewGlobalRef(
+            jniEnv->FindClass("com/whl/quickjs/wrapper/JSFunction")));
+    jsCallFunctionClass = (jclass) (jniEnv->NewGlobalRef(
+            jniEnv->FindClass("com/whl/quickjs/wrapper/JSCallFunction")));
+    quickjsContextClass = (jclass) (jniEnv->NewGlobalRef(
+            jniEnv->FindClass("com/whl/quickjs/wrapper/QuickJSContext")));
+    moduleLoaderClass = (jclass) (jniEnv->NewGlobalRef(
+            jniEnv->FindClass("com/whl/quickjs/wrapper/ModuleLoader")));
+    creatorClass = (jclass) (jniEnv->NewGlobalRef(
+            jniEnv->FindClass("com/whl/quickjs/wrapper/JSObjectCreator")));
     byteArrayClass = (jclass) jniEnv->NewGlobalRef(env->FindClass("[B"));
 
     booleanValueOf = jniEnv->GetStaticMethodID(booleanClass, "valueOf", "(Z)Ljava/lang/Boolean;");
@@ -360,10 +505,12 @@ QuickJSWrapper::QuickJSWrapper(JNIEnv *env, jobject thiz, JSRuntime *rt) {
     doubleGetValue = jniEnv->GetMethodID(doubleClass, "doubleValue", "()D");
     jsObjectGetValue = jniEnv->GetMethodID(jsObjectClass, "getPointer", "()J");
 
-    callFunctionBackM = jniEnv->GetMethodID(quickjsContextClass, "callFunctionBack", "(I[Ljava/lang/Object;)Ljava/lang/Object;");
+    callFunctionBackM = jniEnv->GetMethodID(quickjsContextClass, "callFunctionBack",
+                                            "(I[Ljava/lang/Object;)Ljava/lang/Object;");
     removeCallFunctionM = jniEnv->GetMethodID(quickjsContextClass, "removeCallFunction", "(I)V");
     callFunctionHashCodeM = jniEnv->GetMethodID(objectClass, "hashCode", "()I");
-    creatorM = jniEnv->GetMethodID(quickjsContextClass, "getCreator", "()Lcom/whl/quickjs/wrapper/JSObjectCreator;");
+    creatorM = jniEnv->GetMethodID(quickjsContextClass, "getCreator",
+                                   "()Lcom/whl/quickjs/wrapper/JSObjectCreator;");
     newObjectM = jniEnv->GetMethodID(creatorClass, "newObject",
                                      "(Lcom/whl/quickjs/wrapper/QuickJSContext;J)Lcom/whl/quickjs/wrapper/JSObject;");
     newArrayM = jniEnv->GetMethodID(creatorClass, "newArray",
@@ -394,7 +541,8 @@ QuickJSWrapper::~QuickJSWrapper() {
     jniEnv->DeleteGlobalRef(byteArrayClass);
 }
 
-jobject QuickJSWrapper::toJavaObject(JNIEnv *env, jobject thiz, JSValueConst this_obj, JSValueConst value) const{
+jobject QuickJSWrapper::toJavaObject(JNIEnv *env, jobject thiz, JSValueConst this_obj,
+                                     JSValueConst value) const {
     jobject result;
     switch (JS_VALUE_GET_NORM_TAG(value)) {
         case JS_TAG_EXCEPTION: {
@@ -449,7 +597,8 @@ jobject QuickJSWrapper::toJavaObject(JNIEnv *env, jobject thiz, JSValueConst thi
             jobject creatorObj = env->CallObjectMethod(thiz, creatorM);
             if (JS_IsFunction(context, value)) {
                 auto obj_ptr = reinterpret_cast<jlong>(JS_VALUE_GET_PTR(this_obj));
-                result = env->CallObjectMethod(creatorObj, newFunctionM, thiz, value_ptr, obj_ptr, JS_VALUE_GET_TAG(this_obj));
+                result = env->CallObjectMethod(creatorObj, newFunctionM, thiz, value_ptr, obj_ptr,
+                                               JS_VALUE_GET_TAG(this_obj));
             } else if (JS_IsArray(context, value)) {
                 result = env->CallObjectMethod(creatorObj, newArrayM, thiz, value_ptr);
             } else if (JS_IsArrayBuffer(value)) {
@@ -501,7 +650,8 @@ jobject QuickJSWrapper::getGlobalObject(JNIEnv *env, jobject thiz) const {
     JSValue value = JS_GetGlobalObject(context);
 
     auto value_ptr = reinterpret_cast<jlong>(JS_VALUE_GET_PTR(value));
-    jobject result = env->CallObjectMethod(env->CallObjectMethod(thiz, creatorM), newObjectM, thiz, value_ptr);
+    jobject result = env->CallObjectMethod(env->CallObjectMethod(thiz, creatorM), newObjectM, thiz,
+                                           value_ptr);
 
     JS_FreeValue(context, value);
     return result;
@@ -556,7 +706,7 @@ jobject QuickJSWrapper::call(JNIEnv *env, jobject thiz, jlong func, jlong this_o
         return nullptr;
     }
 
-    for (JSValue argument : freeArguments) {
+    for (JSValue argument: freeArguments) {
         JS_FreeValue(context, argument);
     }
 
@@ -573,8 +723,10 @@ jobject QuickJSWrapper::call(JNIEnv *env, jobject thiz, jlong func, jlong this_o
 }
 
 jstring QuickJSWrapper::jsonStringify(JNIEnv *env, jlong value) const {
-    JSValue obj = JS_JSONStringify(context, JS_MKPTR(JS_TAG_OBJECT, reinterpret_cast<void *>(value)), JS_UNDEFINED, JS_UNDEFINED);
-    if (JS_IsException(obj)){
+    JSValue obj = JS_JSONStringify(context,
+                                   JS_MKPTR(JS_TAG_OBJECT, reinterpret_cast<void *>(value)),
+                                   JS_UNDEFINED, JS_UNDEFINED);
+    if (JS_IsException(obj)) {
         throwJSException(env, context);
         return nullptr;
     }
@@ -616,10 +768,11 @@ void QuickJSWrapper::set(JNIEnv *env, jobject thiz, jlong this_obj, jobject valu
 }
 
 void
-QuickJSWrapper::setProperty(JNIEnv *env, jobject thiz, jlong this_obj, jstring name, jobject value) const {
-    const char* propName = env->GetStringUTFChars(name, JNI_FALSE);
+QuickJSWrapper::setProperty(JNIEnv *env, jobject thiz, jlong this_obj, jstring name,
+                            jobject value) const {
+    const char *propName = env->GetStringUTFChars(name, JNI_FALSE);
     JSValue propValue = toJSValue(env, thiz, value);
-    if(env->IsInstanceOf(value, jsObjectClass)) {
+    if (env->IsInstanceOf(value, jsObjectClass)) {
         // 这里需要手动增加引用计数，不然 QuickJS 垃圾回收会报 assertion "p->ref_count > 0" 的错误。
         JS_DupValue(context, propValue);
     } else if (env->IsInstanceOf(value, jsCallFunctionClass)) {
@@ -639,17 +792,18 @@ QuickJSWrapper::setProperty(JNIEnv *env, jobject thiz, jlong this_obj, jstring n
     env->ReleaseStringUTFChars(name, propName);
 }
 
-JSValue QuickJSWrapper::jsFuncCall(int callback_id, JSValueConst this_val, int argc, JSValueConst *argv){
+JSValue
+QuickJSWrapper::jsFuncCall(int callback_id, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (jniEnv->ExceptionCheck()) {
         return JS_EXCEPTION;
     }
 
-    jobjectArray javaArgs = jniEnv->NewObjectArray((jsize)argc, objectClass, nullptr);
+    jobjectArray javaArgs = jniEnv->NewObjectArray((jsize) argc, objectClass, nullptr);
 
     for (int i = 0; i < argc; i++) {
         JSValue v = JS_DupValue(context, argv[i]);
         auto java_arg = toJavaObject(jniEnv, jniThiz, this_val, v);
-        jniEnv->SetObjectArrayElement(javaArgs, (jsize)i, java_arg);
+        jniEnv->SetObjectArrayElement(javaArgs, (jsize) i, java_arg);
         jniEnv->DeleteLocalRef(java_arg);
     }
 
@@ -678,14 +832,14 @@ JSValue QuickJSWrapper::toJSValue(JNIEnv *env, jobject thiz, jobject value) cons
 
     JSValue result;
     if (env->IsInstanceOf(value, stringClass)) {
-        const auto s = env->GetStringUTFChars((jstring)(value), JNI_FALSE);
+        const auto s = env->GetStringUTFChars((jstring) (value), JNI_FALSE);
         result = JS_NewString(context, s);
-        env->ReleaseStringUTFChars((jstring)(value), s);
+        env->ReleaseStringUTFChars((jstring) (value), s);
     } else if (env->IsInstanceOf(value, doubleClass)) {
         result = JS_NewFloat64(context, env->CallDoubleMethod(value, doubleGetValue));
     } else if (env->IsInstanceOf(value, integerClass)) {
         result = JS_NewInt32(context, env->CallIntMethod(value, integerGetValue));
-    } else if(env->IsInstanceOf(value, longClass)) {
+    } else if (env->IsInstanceOf(value, longClass)) {
         jlong l_val = env->CallLongMethod(value, longGetValue);
         if (l_val > MAX_SAFE_INTEGER || l_val < -MAX_SAFE_INTEGER) {
             result = JS_NewBigInt64(context, l_val);
@@ -696,12 +850,13 @@ JSValue QuickJSWrapper::toJSValue(JNIEnv *env, jobject thiz, jobject value) cons
         result = JS_NewBool(context, env->CallBooleanMethod(value, booleanGetValue));
     } else if (env->IsInstanceOf(value, byteArrayClass)) {
         jbyteArray bytes = static_cast<jbyteArray>(value);
-        jbyte* byteData = env->GetByteArrayElements(bytes, nullptr);
+        jbyte *byteData = env->GetByteArrayElements(bytes, nullptr);
         jsize length = env->GetArrayLength(bytes);
-        result = JS_NewArrayBufferCopy(context, reinterpret_cast<uint8_t*>(byteData), length);
+        result = JS_NewArrayBufferCopy(context, reinterpret_cast<uint8_t *>(byteData), length);
         env->ReleaseByteArrayElements(bytes, byteData, JNI_ABORT);
     } else if (env->IsInstanceOf(value, jsObjectClass)) {
-        result = JS_MKPTR(JS_TAG_OBJECT, reinterpret_cast<void *>(env->CallLongMethod(value, jsObjectGetValue)));
+        result = JS_MKPTR(JS_TAG_OBJECT,
+                          reinterpret_cast<void *>(env->CallLongMethod(value, jsObjectGetValue)));
     } else if (env->IsInstanceOf(value, jsCallFunctionClass)) {
         // 这里的 obj 是用来获取 JSFuncCallback 对象的
         JSValue obj = JS_NewObjectClass(context, js_func_callback_class_id);
@@ -758,10 +913,11 @@ jobject QuickJSWrapper::parseJSON(JNIEnv *env, jobject thiz, jstring json) {
     return result;
 }
 
-jbyteArray QuickJSWrapper::compile(JNIEnv *env, jstring source, jstring file_name, jboolean isModule) const {
+jbyteArray
+QuickJSWrapper::compile(JNIEnv *env, jstring source, jstring file_name, jboolean isModule) const {
     const auto sourceCode = env->GetStringUTFChars(source, JNI_FALSE);
     const auto fileName = env->GetStringUTFChars(file_name, JNI_FALSE);
-    auto eval_flags =  JS_EVAL_FLAG_COMPILE_ONLY;
+    auto eval_flags = JS_EVAL_FLAG_COMPILE_ONLY;
     if (isModule) {
         eval_flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY;
     }
@@ -775,11 +931,12 @@ jbyteArray QuickJSWrapper::compile(JNIEnv *env, jstring source, jstring file_nam
     }
 
     size_t bufferLength = 0;
-    auto buffer = JS_WriteObject(context, &bufferLength, compiled, JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE);
+    auto buffer = JS_WriteObject(context, &bufferLength, compiled,
+                                 JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_REFERENCE);
 
     auto result = buffer && bufferLength > 0 ? env->NewByteArray(bufferLength) : nullptr;
     if (result) {
-        env->SetByteArrayRegion(result, 0, bufferLength, reinterpret_cast<const jbyte*>(buffer));
+        env->SetByteArrayRegion(result, 0, bufferLength, reinterpret_cast<const jbyte *>(buffer));
     } else {
         throwJSException(env, context);
     }
@@ -791,7 +948,7 @@ jbyteArray QuickJSWrapper::compile(JNIEnv *env, jstring source, jstring file_nam
 }
 
 jobject QuickJSWrapper::execute(JNIEnv *env, jobject thiz, jbyteArray bytecode) {
-    if(bytecode == nullptr) {
+    if (bytecode == nullptr) {
         throwJSException(env, "bytecode can not be null");
         return nullptr;
     }
@@ -799,7 +956,8 @@ jobject QuickJSWrapper::execute(JNIEnv *env, jobject thiz, jbyteArray bytecode) 
     const auto buffer = env->GetByteArrayElements(bytecode, nullptr);
     const auto bufferLength = env->GetArrayLength(bytecode);
     const auto flags = JS_READ_OBJ_BYTECODE | JS_READ_OBJ_REFERENCE;
-    auto obj = JS_ReadObject(context, reinterpret_cast<const uint8_t*>(buffer), bufferLength, flags);
+    auto obj = JS_ReadObject(context, reinterpret_cast<const uint8_t *>(buffer), bufferLength,
+                             flags);
     env->ReleaseByteArrayElements(bytecode, buffer, JNI_ABORT);
 
     if (JS_IsException(obj)) {
@@ -874,7 +1032,7 @@ jobject QuickJSWrapper::getOwnPropertyNames(JNIEnv *env, jobject thiz, jlong obj
 jstring QuickJSWrapper::toJavaString(JNIEnv *env, JSValue value) const {
     jstring result;
 #ifdef IS_ANDROID
-    const char* string = JS_ToCString(context, value);
+    const char *string = JS_ToCString(context, value);
     result = env->NewStringUTF(string);
     JS_FreeCString(context, string);
     // JSString 类型的 JSValue 需要手动释放掉，不然会泄漏
@@ -900,3 +1058,6 @@ jstring QuickJSWrapper::toJavaString(JNIEnv *env, JSValue value) const {
 
     return result;
 }
+
+
+
