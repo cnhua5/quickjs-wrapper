@@ -588,6 +588,30 @@ public class QuickJSContext implements Closeable {
         return getOwnPropertyNames(context, object.getPointer());
     }
 
+    /**
+     * 执行加密的JS代码
+     * @param encryptedData 使用JSCrypto.encrypt()加密后的数据
+     * @return 执行结果
+     */
+    public Object executeEncrypted(byte[] encryptedData) {
+        return executeEncrypted(encryptedData, "encrypted.js");
+    }
+
+    /**
+     * 执行加密的JS代码
+     * @param encryptedData 使用JSCrypto.encrypt()加密后的数据
+     * @param fileName 文件名（用于错误堆栈）
+     * @return 执行结果
+     */
+    public Object executeEncrypted(byte[] encryptedData, String fileName) {
+        if (encryptedData == null) {
+            throw new NullPointerException("Encrypted data cannot be null");
+        }
+        checkSameThread();
+        checkDestroyed();
+        return executeEncrypted(context, encryptedData, fileName);
+    }
+
     // runtime
     private native long createRuntime();
     private native void setMaxStackSize(long runtime, int size); // The default is 1024 * 256, and 0 means unlimited.
@@ -618,6 +642,7 @@ public class QuickJSContext implements Closeable {
     private native byte[] compile(long context, String sourceCode, String fileName, boolean isModule); // Bytecode compile
     private native Object execute(long context, byte[] bytecode); // Bytecode execute
     private native Object getOwnPropertyNames(long context, long objValue);
+    private native Object executeEncrypted(long context, byte[] encryptedData, String fileName); // Execute encrypted JS
 
     // destroy context and runtime
     private native void destroyContext(long context);

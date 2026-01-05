@@ -291,3 +291,17 @@ Java_com_whl_quickjs_wrapper_QuickJSContext_setGCThreshold(JNIEnv *env, jobject 
     }
     JS_SetGCThreshold(rt, size);
 }
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_com_whl_quickjs_wrapper_QuickJSContext_executeEncrypted(JNIEnv *env, jobject thiz, 
+                                                              jlong context, jbyteArray encrypted_data,
+                                                              jstring file_name) {
+    if (encrypted_data == nullptr) {
+        env->ThrowNew(env->FindClass("java/lang/NullPointerException"), "Encrypted data cannot be null");
+        return nullptr;
+    }
+    
+    auto wrapper = reinterpret_cast<QuickJSWrapper*>(context);
+    return wrapper->executeEncrypted(env, thiz, encrypted_data, file_name);
+}

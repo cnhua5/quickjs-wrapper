@@ -20,6 +20,10 @@ android {
                 cppFlags '-DIS_ANDROID=TRUE'
             }
         }
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
     }
 
     buildTypes {

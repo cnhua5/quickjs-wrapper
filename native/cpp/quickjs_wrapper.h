@@ -91,6 +91,9 @@ public:
     jobject evaluateModule(JNIEnv *env, jobject thiz, jstring script, jstring file_name);
 
     jobject getOwnPropertyNames(JNIEnv *env, jobject thiz, jlong obj);
+    
+    // 执行加密的JS代码
+    jobject executeEncrypted(JNIEnv *env, jobject thiz, jbyteArray encryptedData, jstring file_name);
 };
 
 #endif //QUICKJS_TEST_CONTEXT_WRAPPER_H

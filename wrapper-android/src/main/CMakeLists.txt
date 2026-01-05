@@ -13,6 +13,7 @@ file(GLOB android_src
         "cpp/quickjs_android.cpp"
         )
 
+
 add_library( # Sets the name of the library.
         quickjs-android-wrapper
 
@@ -35,6 +36,9 @@ find_library( # Sets the name of the path variable.
         # you want CMake to locate.
         log )
 
+# ²éÕÒzlib¿â£¨Android NDK×Ô´ø£©
+find_library(z-lib z)
+
 # Specifies libraries CMake should link to your target library. You
 # can link multiple libraries, such as libraries you define in this
 # build script, prebuilt third-party libraries, or system libraries.
@@ -44,4 +48,5 @@ target_link_libraries( # Specifies the target library.
         "-Wl,-z,max-page-size=16384"
         # Links the target library to the log library
         # included in the NDK.
-        ${log-lib})
+        ${log-lib}
+        ${z-lib})

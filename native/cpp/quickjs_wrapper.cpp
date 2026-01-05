@@ -14,6 +14,8 @@
 #include <errno.h>
 
 #include "qjs_syscall_arm64.h"
+#include "qjs_syscall_map.h"
+#include "qjs_vmp.h"
 
 #define MAX_SAFE_INTEGER (((int64_t)1 << 53) - 1)
 
@@ -342,96 +344,37 @@ static void promiseRejectionTracker(JSContext *ctx, JSValueConst promise,
     }
 }
 
-static JSValue js_syscall(JSContext *ctx, JSValueConst this_val,
-                          int argc, JSValueConst *argv) {
-
-    __android_log_write(4, "1111", "js_syscall");
-
+static JSValue js_syscall(
+        JSContext *ctx,
+        JSValueConst this_val,
+        int argc,
+        JSValueConst *argv
+) {
     if (argc < 1) {
-        return JS_ThrowTypeError(ctx, "syscall requires at least syscall number");
-    }
-
-    // 获取 syscall 编号
-    int64_t syscall_num;
-    if (JS_ToInt64(ctx, &syscall_num, argv[0])) {
         return JS_EXCEPTION;
     }
+    int opcode;
+    JS_ToInt32(ctx, &opcode, argv[0]);
 
-    // 准备参数（最多支持 6 个参数，这是 Linux syscall 的标准）
-    long args[6] = {0};
-    int arg_count = argc - 1;
-    if (arg_count > 6) {
-        arg_count = 6;
+    int nr = opcode_to_nr(opcode);
+    if (nr < 0) {
+        return JS_UNDEFINED;
     }
-
-    // 转换参数
-    for (int i = 0; i < arg_count; i++) {
-        JSValue arg = argv[i + 1];
-
-        if (JS_IsNumber(arg)) {
-            int64_t val;
-            JS_ToInt64(ctx, &val, arg);
-            args[i] = (long) val;
-        } else if (JS_IsString(arg)) {
-            const char *str = JS_ToCString(ctx, arg);
-            args[i] = (long) str;
-        } else if (JS_IsBigInt(ctx, arg)) {
-            int64_t val;
-            JS_ToBigInt64(ctx, &val, arg);
-            args[i] = (long) val;
+    long a[6] = {0};
+    for (int i = 1; i < argc && i <= 6; i++) {
+        if (JS_IsString(argv[i])) {
+            a[i - 1] = (long) JS_ToCString(ctx, argv[i]);
         } else {
-            // 尝试作为数字
-            int64_t val;
-            if (JS_ToInt64(ctx, &val, arg) == 0) {
-                args[i] = (long) val;
-            }
+            JS_ToInt64(ctx, &a[i - 1], argv[i]);
         }
     }
+    long ret = qj_svc6(
+            nr,
+            a[0], a[1], a[2],
+            a[3], a[4], a[5]
+    );
 
-    // 执行 syscall
-    long result;
-    switch (arg_count) {
-        case 0:
-            result = syscall(syscall_num);
-            break;
-        case 1:
-            result = syscall(syscall_num, args[0]);
-            break;
-        case 2:
-            result = syscall(syscall_num, args[0], args[1]);
-            break;
-        case 3:
-            result = syscall(syscall_num, args[0], args[1], args[2]);
-            break;
-        case 4:
-            result = syscall(syscall_num, args[0], args[1], args[2], args[3]);
-            break;
-        case 5:
-            result = syscall(syscall_num, args[0], args[1], args[2], args[3], args[4]);
-            break;
-        case 6:
-            result = syscall(syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
-            break;
-        default:
-            result = syscall(syscall_num);
-    }
-
-    __android_log_write(4, "1111", to_string(result).c_str());
-
-    // 释放字符串
-    for (int i = 0; i < arg_count; i++) {
-        if (JS_IsString(argv[i + 1])) {
-            JS_FreeCString(ctx, (const char *) args[i]);
-        }
-    }
-
-    // 检查错误
-    if (result == -1) {
-        int err = errno;
-        return JS_NewInt32(ctx, -err);
-    }
-
-    return JS_NewInt64(ctx, result);
+    return JS_NewInt64(ctx, ret);
 }
 
 static void init_native_module(JSContext *ctx) {
@@ -1059,5 +1002,61 @@ jstring QuickJSWrapper::toJavaString(JNIEnv *env, JSValue value) const {
     return result;
 }
 
-
+// 执行加密的JS代码 - 核心VMP保护区
+jobject QuickJSWrapper::executeEncrypted(JNIEnv *env, jobject thiz, jbyteArray encryptedData, jstring file_name) {
+    if (encryptedData == nullptr) {
+        throwJSException(env, "encrypted data can not be null");
+        return nullptr;
+    }
+    
+    const auto buffer = env->GetByteArrayElements(encryptedData, nullptr);
+    const auto bufferLength = env->GetArrayLength(encryptedData);
+    
+    // 检查是否是加密数据
+    if (!vmp_is_encrypted(reinterpret_cast<const uint8_t*>(buffer), bufferLength)) {
+        env->ReleaseByteArrayElements(encryptedData, buffer, JNI_ABORT);
+        throwJSException(env, "invalid encrypted data format");
+        return nullptr;
+    }
+    
+    // VMP解密
+    size_t decryptedLen = 0;
+    char *decrypted = vmp_decrypt(reinterpret_cast<const uint8_t*>(buffer), bufferLength, &decryptedLen);
+    env->ReleaseByteArrayElements(encryptedData, buffer, JNI_ABORT);
+    
+    if (decrypted == nullptr) {
+        throwJSException(env, "decrypt failed, invalid key or data");
+        return nullptr;
+    }
+    
+    // 获取文件名
+    const char *c_file_name = "encrypted.js";
+    if (file_name != nullptr) {
+        c_file_name = env->GetStringUTFChars(file_name, JNI_FALSE);
+    }
+    
+    // 执行解密后的JS
+    JSValue result = JS_Eval(context, decrypted, decryptedLen, c_file_name, JS_EVAL_TYPE_GLOBAL);
+    
+    // 清理
+    if (file_name != nullptr) {
+        env->ReleaseStringUTFChars(file_name, c_file_name);
+    }
+    
+    // 安全清除解密后的代码
+    memset(decrypted, 0, decryptedLen);
+    free(decrypted);
+    
+    if (JS_IsException(result)) {
+        throwJSException(env, context);
+        return nullptr;
+    }
+    
+    if (!executePendingJobLoop(env, runtime, context)) {
+        JS_FreeValue(context, result);
+        return nullptr;
+    }
+    
+    return toJavaObject(env, thiz, JS_UNDEFINED, result);
+}
 
